@@ -12,6 +12,7 @@ def parse_args():
     parser.add_argument("--model_type", default='bert', type=str)
     parser.add_argument("--inter_or_intra", default='intra_and_inter', type=str)
     parser.add_argument("--k_fold", default=5, type=int)
+    parser.add_argument('--fold_idx', default=-1, type=int, help='run only this fold (0-indexed); -1 = all folds')
     parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
     parser.add_argument('--use_cache', default=True, action="store_true")
     parser.add_argument('--in_channels', default={'event': 768}, type=dict)
@@ -44,6 +45,28 @@ def parse_args():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument("--weight_decay", default=0.01, type=float)
     parser.add_argument('--rate', default=0.0, type=float)
+
+    # --- adaptive confidence threshold (iLIF improvement) ---
+    parser.add_argument('--use_dynamic', action='store_true', default=False,
+                        help='enable structure-difference-driven adaptive threshold')
+    parser.add_argument('--use_persistence', action='store_true', default=False,
+                        help='enable temporal-persistence edge-level threshold discount')
+    parser.add_argument('--w_max', default=0.70, type=float, help='initial (max) confidence threshold omega_max')
+    parser.add_argument('--w_min', default=0.40, type=float, help='minimum confidence threshold omega_min')
+    parser.add_argument('--ema_alpha', default=0.5, type=float, help='EMA smoothing for structural difference')
+    parser.add_argument('--persist_lambda', default=0.05, type=float, help='per-iteration persistence discount')
+    parser.add_argument('--persist_base', default=0.5, type=float, help='confidence floor to accumulate persistence')
+    parser.add_argument('--w_floor', default=0.35, type=float, help='absolute edge-level threshold floor')
+
+    # --- inference-only annealed threshold ---
+    parser.add_argument('--use_infer_anneal', action='store_true', default=False,
+                        help='anneal the confidence threshold during inference only (training stays argmax)')
+    parser.add_argument('--anneal_start', default=0.65, type=float, help='inference threshold at iteration 0')
+    parser.add_argument('--anneal_step', default=0.05, type=float, help='per-iteration threshold step (magnitude)')
+    parser.add_argument('--anneal_floor', default=0.45, type=float, help='inference threshold floor (for direction=down)')
+    parser.add_argument('--anneal_direction', default='down', type=str, choices=['down', 'up'],
+                        help='anneal direction: down (strict->loose) or up (loose->strict)')
+    parser.add_argument('--anneal_ceiling', default=0.65, type=float, help='inference threshold ceiling (for direction=up)')
     parser.add_argument("--adam_epsilon", default=1e-8, type=float)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--warm_up_ratio", default=0.1, type=float)

@@ -173,7 +173,9 @@ def cross_validation(args, model_class, processor):
 
     avg_test_f1, avg_test_r, avg_test_p, avg_test_intra_p, avg_test_intra_r, avg_test_intra_f1, avg_test_cross_p, avg_test_cross_r, avg_test_cross_f1 = [], [], [], [], [], [], [], [], []
     # 5 folds
-    for fold, (train_idx, test_idx) in enumerate(splits.split(train_test_dataset)):
+    all_splits = list(splits.split(train_test_dataset))
+    fold_iter = [(args.fold_idx, all_splits[args.fold_idx])] if args.fold_idx >= 0 else list(enumerate(all_splits))
+    for fold, (train_idx, test_idx) in fold_iter:
         printlog("Fold {}".format(fold + 1))
         train_dataset = Subset(train_test_dataset, train_idx)
         test_dataset = Subset(train_test_dataset, test_idx)
@@ -230,6 +232,10 @@ def cross_validation(args, model_class, processor):
                         best_valid_test_cross = test_cross
 
         printlog('Fold {}: R {} P {} F {} intra{} cross{}'.format(fold + 1, best_valid_test_r, best_valid_test_p, best_valid_test_f1, best_valid_test_intra, best_valid_test_cross))
+        printlog('FOLD_RESULT fold={} P={:.6f} R={:.6f} F1={:.6f} intra_p={:.6f} intra_r={:.6f} intra_f1={:.6f} cross_p={:.6f} cross_r={:.6f} cross_f1={:.6f}'.format(
+            fold + 1, best_valid_test_p, best_valid_test_r, best_valid_test_f1,
+            best_valid_test_intra['p'], best_valid_test_intra['r'], best_valid_test_intra['f1'],
+            best_valid_test_cross['p'], best_valid_test_cross['r'], best_valid_test_cross['f1']))
         avg_test_f1.append(best_valid_test_f1)
         avg_test_r.append(best_valid_test_r)
         avg_test_p.append(best_valid_test_p)
@@ -266,7 +272,16 @@ def main():
     args.log = Path(f"./logout/seed:{args.seed}")
     args.log.mkdir(exist_ok=True, parents=True)
 
-    args.log = str(args.log) + '/t_lr' + str(args.t_lr) + 'lr' + str(args.lr) + t + '.txt'
+    if args.use_persistence:
+        mode = 'full'
+    elif args.use_dynamic:
+        mode = 'dynamic'
+    elif args.use_infer_anneal:
+        mode = 'anneal_up' if getattr(args, 'anneal_direction', 'down') == 'up' else 'anneal'
+    else:
+        mode = 'baseline'
+    fold_suffix = '_fold{}'.format(args.fold_idx) if args.fold_idx >= 0 else ''
+    args.log = str(args.log) + '/t_lr' + str(args.t_lr) + 'lr' + str(args.lr) + '_' + mode + fold_suffix + '_' + t + '.txt'
 
     for name in logging.root.manager.loggerDict:
         if 'transformers' in name:

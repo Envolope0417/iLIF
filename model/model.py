@@ -61,6 +61,23 @@ class bertCSRModel(nn.Module):
         self.focal_loss = focal_loss(gamma=args.gamma, num_classes=args.no_of_classes)
         self.ce_loss = torch.nn.CrossEntropyLoss(reduction='mean')
         self.loss_type = args.loss_type
+        # --- adaptive confidence threshold (iLIF improvement) ---
+        self.use_dynamic = getattr(args, 'use_dynamic', False)
+        self.use_persistence = getattr(args, 'use_persistence', False)
+        self.w_max = getattr(args, 'w_max', 0.70)
+        self.w_min = getattr(args, 'w_min', 0.40)
+        self.ema_alpha = getattr(args, 'ema_alpha', 0.5)
+        self.persist_lambda = getattr(args, 'persist_lambda', 0.05)
+        self.persist_base = getattr(args, 'persist_base', 0.5)
+        self.w_floor = getattr(args, 'w_floor', 0.35)
+        self.use_infer_anneal = getattr(args, 'use_infer_anneal', False)
+        self.anneal_start = getattr(args, 'anneal_start', 0.65)
+        self.anneal_step = getattr(args, 'anneal_step', 0.05)
+        self.anneal_floor = getattr(args, 'anneal_floor', 0.45)
+        self.anneal_direction = getattr(args, 'anneal_direction', 'down')
+        self.anneal_ceiling = getattr(args, 'anneal_ceiling', 0.65)
+        self._debug_omega = []
+        self._debug_nedge = []
 
     def forward(self, enc_input_ids, enc_mask_ids, node_event, t1_pos, t2_pos, target, rel_type, event_pairs):
         sent_emb = self.pretrained_model(enc_input_ids, enc_mask_ids)[0].to(self.device)
@@ -94,6 +111,22 @@ class bertCSRModel(nn.Module):
             target = torch.cat([torch.tensor(t) for t in target], dim=0).to(self.device)
         else:
             target = torch.tensor(target[0]).to(self.device)
+
+        # --- adaptive threshold state (per document) ---
+        num_pairs = len(event_pairs)
+        if self.use_dynamic:
+            cur_w = self.w_max
+        elif self.use_infer_anneal and not self.training:
+            cur_w = self.anneal_start
+        else:
+            cur_w = self.rate if self.training else self.w
+        C = torch.zeros(num_pairs, device=self.device) if self.use_persistence else None
+        d_bar = None
+        d_ref = 1.0
+        edge_set_prev = None
+        self._debug_omega = []
+        self._debug_nedge = []
+
         while iteration < max_iteration and (iteration < self.min_iteration or difference > self.threshold):
             if len(event_pairs) > 1:
                 event_diff = torch.cat([event_embed[[pair[0]]] - event_embed[[pair[1]]] for pair in event_pairs])
@@ -105,7 +138,47 @@ class bertCSRModel(nn.Module):
                 loss += (1/(iteration + 1)) * self.focal_loss(prediction, target)
             else:
                 loss += (1/(iteration + 1)) * self.ce_loss(prediction, target)
-            graphedge_index = self.get_graphedge_index(prediction, event_pairs, rel_type)
+
+            # per-edge confidence thresholds
+            if self.use_dynamic:
+                if self.use_persistence:
+                    rates = torch.clamp(cur_w - self.persist_lambda * C, min=self.w_floor)
+                else:
+                    rates = cur_w
+            else:
+                rates = cur_w
+            self._debug_omega.append(float(cur_w))
+            graphedge_index, edge_set = self.get_graphedge_index(prediction, event_pairs, rel_type, rates)
+            self._debug_nedge.append(len(edge_set))
+
+            # structural difference -> adapt the global threshold for the next iteration
+            # (ratchet: only ever relax, never tighten -- prevents oscillation)
+            if self.use_dynamic and iteration >= 1:
+                d_l = len(edge_set ^ edge_set_prev) if edge_set_prev is not None else len(edge_set)
+                if d_bar is None:
+                    d_bar = float(d_l)
+                    d_ref = max(d_bar, 1.0)
+                else:
+                    d_bar = self.ema_alpha * d_l + (1 - self.ema_alpha) * d_bar
+                r = min(max(d_bar / d_ref, 0.0), 1.0)
+                cur_w = min(cur_w, self.w_min + (self.w_max - self.w_min) * r)
+
+            # inference-only fixed anneal (per-iteration threshold step)
+            if self.use_infer_anneal and not self.training:
+                if self.anneal_direction == 'up':
+                    cur_w = min(cur_w + self.anneal_step, self.anneal_ceiling)
+                else:
+                    cur_w = max(cur_w - self.anneal_step, self.anneal_floor)
+
+            # temporal-persistence counter update for the next iteration
+            if self.use_persistence:
+                pred_soft = torch.softmax(prediction, dim=1)
+                pred_max, pred_arg = pred_soft.max(dim=1)
+                eligible = (pred_arg != 0) & (pred_max >= self.persist_base)
+                C = torch.where(eligible, C + 1.0, torch.zeros_like(C))
+
+            edge_set_prev = edge_set
+
             if graphedge_index.__len__() > 0:
                 node_length = event_embed.size()[0]
                 self_loop = torch.cat((torch.arange(node_length).unsqueeze(0), torch.arange(node_length).unsqueeze(0)),dim=0).to(self.device)
@@ -135,68 +208,45 @@ class bertCSRModel(nn.Module):
         event_embed = e1_embed / length
         return event_embed
 
-    # Construct adjacency matrix
-    def get_graphedge_index(self, prediction, event_pair, rel_type):
+    # Construct adjacency matrix (and return the admitted edge set for structural difference)
+    def get_graphedge_index(self, prediction, event_pair, rel_type, rates):
+        pred_soft = torch.softmax(prediction, dim=1)
+        pred_max, pred_arg = pred_soft.max(dim=1)          # [num_pairs]
+        rel0 = (torch.as_tensor(rel_type[0], device=self.device) == 0)
+        rates_t = torch.as_tensor(rates, dtype=pred_max.dtype, device=self.device)
+        keep = (pred_arg != 0) & (pred_max > rates_t)      # causal + above threshold
+        keep1 = keep & (pred_arg == 1)                     # CAUSE: pair[0] -> pair[1]
+        keep2 = keep & (pred_arg == 2)                     # EFFECT: pair[1] -> pair[0]
+
+        pairs = torch.tensor([[p[0], p[1]] for p in event_pair], device=self.device).long()  # [num_pairs, 2]
+
+        intra1 = pairs[keep1 & rel0]
+        intra2 = pairs[keep2 & rel0]
+        inter1 = pairs[keep1 & (~rel0)]
+        inter2 = pairs[keep2 & (~rel0)]
+
+        intra_index = torch.cat([
+            torch.stack([intra1[:, 0], intra1[:, 1]], dim=0),
+            torch.stack([intra2[:, 1], intra2[:, 0]], dim=0),
+        ], dim=-1)
+
+        inter_index = torch.cat([
+            torch.stack([inter1[:, 0], inter1[:, 1]], dim=0),
+            torch.stack([inter2[:, 1], inter2[:, 0]], dim=0),
+        ], dim=-1)
+
         graphedge_index = {}
-        if self.training:
-            rate = self.rate
-        else:
-            rate = self.w
-        if rate != 0:
-            pred_soft = torch.softmax(prediction, dim=1)
-            tmp = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 1 and rel_type[0][j] == 0)]).t().to(self.device)
-            tmp_1 = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 2 and rel_type[0][j] == 0)]).t().to(self.device)
-            if tmp.size()[0] > 0:
-                intra_graphedge_index_1 = torch.cat(([torch.cat((torch.tensor([pair[0]]).unsqueeze(0).to(self.device), torch.tensor([pair[1]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 1 and rel_type[0][j] == 0)]), dim=-1)
-            else:
-                intra_graphedge_index_1 = tmp
-            if tmp_1.size()[0] > 0:
-                intra_graphedge_index_2 = torch.cat(([torch.cat((torch.tensor([pair[1]]).unsqueeze(0).to(self.device), torch.tensor([pair[0]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 2 and rel_type[0][j] == 0)]), dim=-1)
-            else:
-                intra_graphedge_index_2 = tmp_1
-            intra_graphedge_index = torch.cat((intra_graphedge_index_1, intra_graphedge_index_2), dim=-1)
+        if intra_index.size(1) > 0:
+            graphedge_index[('event', 'intra', 'event')] = intra_index.long()
+        if inter_index.size(1) > 0:
+            graphedge_index[('event', 'inter', 'event')] = inter_index.long()
 
-            tmp = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 1 and rel_type[0][j] == 1)]).t().to(self.device)
-            tmp_1 = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 2 and rel_type[0][j] == 1)]).t().to(self.device)
-            if tmp.size()[0] > 0:
-                inter_graphedge_index_1 = torch.cat(([torch.cat((torch.tensor([pair[0]]).unsqueeze(0).to(self.device), torch.tensor([pair[1]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 1 and rel_type[0][j] == 1)]), dim=-1)
-            else:
-                inter_graphedge_index_1 = tmp
-            if tmp_1.size()[0] > 0:
-                inter_graphedge_index_2 = torch.cat(([torch.cat((torch.tensor([pair[1]]).unsqueeze(0).to(self.device), torch.tensor([pair[0]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (torch.max(pred_soft[j], dim=0)[0] > rate and torch.max(pred_soft[j], dim=0)[1] == 2 and rel_type[0][j] == 1)]), dim=-1)
-            else:
-                inter_graphedge_index_2 = tmp_1
-            inter_graphedge_index = torch.cat((inter_graphedge_index_1, inter_graphedge_index_2), dim=-1)
-        else:
-            predt = torch.argmax(prediction, dim=1)
-            tmp = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (predt[j] == 1 and rel_type[0][j] == 0)]).t().to(self.device)
-            tmp_1 = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (predt[j] == 2 and rel_type[0][j] == 0)]).t().to(self.device)
-            if tmp.size()[0] > 0:
-                intra_graphedge_index_1 = torch.cat(([torch.cat((torch.tensor([pair[0]]).unsqueeze(0).to(self.device), torch.tensor([pair[1]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (predt[j] == 1 and rel_type[0][j] == 0)]), dim=-1)
-            else:
-                intra_graphedge_index_1 = tmp
-            if tmp_1.size()[0] > 0:
-                intra_graphedge_index_2 = torch.cat(([torch.cat((torch.tensor([pair[1]]).unsqueeze(0).to(self.device), torch.tensor([pair[0]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (predt[j] == 2 and rel_type[0][j] == 0)]), dim=-1)
-            else:
-                intra_graphedge_index_2 = tmp_1
-            intra_graphedge_index = torch.cat((intra_graphedge_index_1, intra_graphedge_index_2), dim=-1)
-
-            tmp = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (predt[j] == 1 and rel_type[0][j] == 1)]).t().to(self.device)
-            tmp_1 = torch.tensor([[pair[0], pair[1]] for j, pair in enumerate(event_pair) if (predt[j] == 2 and rel_type[0][j] == 1)]).t().to(self.device)
-            if tmp.size()[0] > 0:
-                inter_graphedge_index_1 = torch.cat(([torch.cat((torch.tensor([pair[0]]).unsqueeze(0).to(self.device), torch.tensor([pair[1]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (predt[j] == 1 and rel_type[0][j] == 1)]), dim=-1)
-            else:
-                inter_graphedge_index_1 = tmp
-            if tmp_1.size()[0] > 0:
-                inter_graphedge_index_2 = torch.cat(([torch.cat((torch.tensor([pair[1]]).unsqueeze(0).to(self.device), torch.tensor([pair[0]]).unsqueeze(0).to(self.device)), dim=0) for j, pair in enumerate(event_pair) if (predt[j] == 2 and rel_type[0][j] == 1)]), dim=-1)
-            else:
-                inter_graphedge_index_2 = tmp_1
-            inter_graphedge_index = torch.cat((inter_graphedge_index_1, inter_graphedge_index_2), dim=-1)
-        if intra_graphedge_index.size()[0] > 0:
-            graphedge_index[('event', 'intra', 'event')] = intra_graphedge_index.long()
-        if inter_graphedge_index.size()[0] > 0:
-            graphedge_index[('event', 'inter', 'event')] = inter_graphedge_index.long()
-        return graphedge_index
+        edge_set = set()
+        if intra_index.size(1) > 0:
+            edge_set.update(tuple(e) for e in intra_index.t().tolist())
+        if inter_index.size(1) > 0:
+            edge_set.update(tuple(e) for e in inter_index.t().tolist())
+        return graphedge_index, edge_set
 
     # Compare the structural differences before and after iteration
     def Contrast_pre(self, prediction, prediction_last):

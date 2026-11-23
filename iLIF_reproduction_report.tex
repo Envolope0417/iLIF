@@ -1,0 +1,301 @@
+% !TeX program = xelatex
+% iLIF 论文复现实验报告
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{siunitx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=2em}
+
+\title{\bfseries iLIF 论文复现实验报告\\[0.3em]
+\large 文档级事件因果关系识别（Document-level Event Causality Identification）}
+\author{\textbf{实验人：}陈冠豪、徐天宁\qquad\textbf{指导老师：}王邦}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\vspace{-2em}
+
+\begin{abstract}
+本文复现 ACL 2024 论文 \emph{Identifying while Learning for Document Event Causality Identification} 提出的迭代学习与识别框架（iLIF），并在其基础上围绕``置信度建图阈值''这一关键机制设计了四组改进实验（训练期动态阈值、动态阈值+时间持续性、推理期下退火、推理期反向退火）。基线在 EventStoryLine v0.9 上取得 5 折平均 F1 $=$ 0.4365，与原文机制分析一致；四组改进实验的 F1 分别为 0.4068、0.3943、0.4152、0.4183，均低于基线。实验表明：在``建图''位置收紧阈值必然以牺牲召回为代价，且召回损失沿迭代链被放大，无法靠后续放宽补回；阈值若要用，应作用于最终输出的决策边界而非图结构本身。
+\end{abstract}
+
+\tableofcontents
+
+\section{引言}
+
+文档级事件因果关系识别（Document-level Event Causality Identification，DECI）旨在从一篇文档中识别事件之间的因果关系。与句级任务不同，DECI 需要跨句建模，因果事件对往往相距较远，且文档中的事件通过链式（chain）、分叉（fork）、对撞（collider）等结构组织成一张事件因果图（Event Causality Graph，ECG）。
+
+iLIF 论文提出``边识别边学习''（Identifying while Learning）的迭代框架：模型在每一轮迭代中不仅输出因果关系的预测，还把预测结果构造成图、作为下一轮迭代的输入，从而让图结构信息逐步增强事件表示。本报告对该框架进行复现，并对其中最关键、也最直觉上可改进的``置信度阈值建图''机制进行了系统的改进实验与归因分析。
+
+\section{任务与数据集}
+
+\subsection{任务定义}
+
+给定一篇文档 $D=\{e_1, e_2, \dots, e_n\}$，其中 $e_i$ 为文档中的事件提及。对每一对事件 $(e_i, e_j)$，模型需要输出一个三分类标签：
+\begin{equation}
+y_{ij} \in \{\texttt{NONE},\ \texttt{CAUSE},\ \texttt{EFFECT}\}
+\end{equation}
+其中 \texttt{CAUSE} 表示 $e_i$ 是 $e_j$ 的原因，\texttt{EFFECT} 表示 $e_i$ 是 $e_j$ 的结果，\texttt{NONE} 表示两者无因果关系。所有非 \texttt{NONE} 的边共同构成最终的因果图输出。
+
+\subsection{数据集}
+
+复现使用 EventStoryLine v0.9，训练集 233 篇、开发集 25 篇，采用 5 折交叉验证，随机种子 $\mathrm{seed}=209$。评估指标为宏观平均的精确率（P）、召回率（R）与 F1，其中句内（intra）边与句间（inter）边分别统计后取宏平均。
+
+\section{模型与方法}
+
+\subsection{iLIF 框架}
+
+iLIF 由四个模块组成：
+
+\begin{enumerate}
+\item \textbf{CTE（Contextual Text Encoder）}：用 BERT 编码文档，提取事件提及的上下文表示；
+\item \textbf{CGE（Causal Graph Encoder）}：基于 GAT 式消息传递的因果图编码器，将图结构信息注入事件嵌入；句内边与句间边作为两类异质边分别做注意力聚合，再通过固定标量 $\beta_{\mathrm{intra}},\ \beta_{\mathrm{inter}}$ 线性融合；
+\item \textbf{ECI（Event Causality Identifier）}：MLP 分类器，对每个事件对输出 3 分类概率；
+\item \textbf{CGC（Causal Graph Constructor）}：将本轮预测结果构造成下一轮的因果图。
+\end{enumerate}
+
+整个框架以迭代方式运行 $T$ 轮（$\mathrm{max\_iteration}=9$，$\mathrm{min\_iteration}=2$），第 $t$ 轮的图由第 $t$ 轮的预测构造，作为第 $t+1$ 轮的输入。
+
+\subsection{原文的两个关键机制}
+
+\textbf{（1）训练建图用 argmax（密图）。} 训练阶段 $\mathrm{rate}=0.0$，凡被判为 \texttt{CAUSE}/\texttt{EFFECT} 的边不考虑置信度全部入图，每轮约 425 条边，即``密图''。
+
+\textbf{（2）评测建图用阈值。} 评测阶段 $w=0.6$，只保留置信度 $>0.6$ 的因果边，约过滤 27\% 的边。
+
+\textbf{（3）损失折扣。} 各轮损失按 $\frac{1}{t+1}$ 加权求和：
+\begin{equation}
+\mathcal{L} = \sum_{t=0}^{T-1} \frac{1}{t+1}\,\mathcal{L}_{\mathrm{focal}}^{(t)}
+\end{equation}
+第 0 轮权重为 1、第 1 轮为 $1/2$、第 2 轮为 $1/3$，即早期轮次权重更高。
+
+\subsection{复现配置}
+
+\begin{itemize}
+\item 硬件：4$\times$RTX 2080 Ti（11 GB），单进程/卡；
+\item 软件：conda 环境 \texttt{ilif}，Python 3.8.20 / PyTorch 1.13.1+cu117 / transformers 4.15.0；
+\item 超参：$\mathrm{t\_lr}=2\times10^{-5}$，$\mathrm{lr}=10^{-4}$，$w=0.6$，$\mathrm{threshold}=2$，$\mathrm{epoch}=30$，$\mathrm{batch\_size}=1$，$\mathrm{max\_iteration}=9$，$\mathrm{min\_iteration}=2$，$\mathrm{num\_heads}=4$，$\mathrm{mlp\_drop}=0.4$，$\mathrm{seed}=209$，$\gamma=2.0$（focal loss）；
+\item 权重：BERT 权重以本地路径加载（网络受限，规避 \texttt{huggingface.co}）。
+\end{itemize}
+
+\section{基线复现结果}
+
+基线在 EventStoryLine v0.9 上的 5 折平均结果为：
+
+\begin{table}[H]
+\centering
+\caption{基线（iLIF）5 折结果}
+\label{tab:baseline}
+\begin{tabular}{lccc}
+\toprule
+指标 & P & R & F1 \\
+\midrule
+句内（intra） & 0.6185 & 0.5106 & 0.5549 \\
+句间（cross） & 0.3550 & 0.4613 & 0.3926 \\
+\textbf{宏平均} & \textbf{0.4156} & \textbf{0.4773} & \textbf{0.4365} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+逐折 F1 如表~\ref{tab:baseline_fold} 所示。
+
+\begin{table}[H]
+\centering
+\caption{基线逐折 F1}
+\label{tab:baseline_fold}
+\begin{tabular}{lccccc}
+\toprule
+fold & 1 & 2 & 3 & 4 & 5 \\
+\midrule
+F1 & 0.4469 & 0.4327 & 0.4040 & 0.4667 & 0.4323 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{改进实验}
+
+复现之余，针对``置信度阈值建图''这一机制设计了四组改进实验。核心动机是：固定阈值 $w=0.6$ 显然不是最优，直觉上应让阈值``自适应''——例如根据图结构的变化幅度动态调整。四组实验如下。
+
+\subsection{实验①：训练期动态阈值（dynamic）}
+
+新增 \texttt{--use\_dynamic}：阈值初值 $w_{\max}=0.70$，按``相邻两轮图结构的对称差''做 EMA 平滑，用棘轮（ratchet）\emph{只降不升}地调整：
+\begin{equation}
+\mathrm{cur\_w} \leftarrow \min\!\big(\mathrm{cur\_w},\ w_{\min}+(w_{\max}-w_{\min})\cdot r\big)
+\end{equation}
+该阈值在训练与评测中都生效，替换训练期的 argmax 建图。
+
+\subsection{实验②：动态阈值 + 时间持续性（full）}
+
+在实验①基础上新增 \texttt{--use\_persistence}：为每条边维护``连续被高置信判为因果''的计数器 $C$，持续越久阈值折扣越大：
+\begin{equation}
+\mathrm{rates} = \mathrm{clamp}\!\big(\mathrm{cur\_w} - \lambda\cdot C,\ \min=w_{\mathrm{floor}}\big)
+\end{equation}
+意图是对反复出现的因果边放宽门槛、对噪声边保持严格。
+
+\subsection{实验③：推理期下退火（anneal）}
+
+新增 \texttt{--use\_infer\_anneal}：训练保持 argmax 不变，仅评测期把建图阈值按固定节奏退火：
+\begin{equation}
+\omega = \max\!\big(0.65 - 0.05\cdot t,\ 0.45\big)
+\end{equation}
+即 $0.65\to0.60\to0.55\to0.50\to0.45$ 后保持不变，``先严后松''。
+
+\subsection{实验④：推理期反向退火（anneal\_up）}
+
+新增 \texttt{--anneal\_direction up}：训练仍保持 argmax，评测期阈值从低到高：
+\begin{equation}
+\omega = \min\!\big(0.55 + 0.05\cdot t,\ 0.65\big)
+\end{equation}
+即 $0.55\to0.60\to0.65$ 后保持不变，``先松后紧''。该实验只跑 4 折（fold 1--4）。
+
+\section{实验结果}
+
+\subsection{五折口径：三组改进 vs 基线}
+
+\begin{table}[H]
+\centering
+\caption{五折平均结果对比（实验①②③ vs baseline）}
+\label{tab:main5}
+\begin{tabular}{lcccccc}
+\toprule
+方案 & 阈值作用于 & 训练建图 & P & R & F1 & $\Delta$F1 \\
+\midrule
+baseline & 固定 0.6 & argmax（密图） & 0.4156 & 0.4773 & \textbf{0.4365} & --- \\
+动态阈值① & 训练+评测 & 动态阈值 & 0.4280 & 0.4010 & 0.4068 & $-0.0297$ \\
+动态+持续② & 训练+评测 & 动态阈值+持续性 & 0.4564 & 0.3584 & 0.3943 & $-0.0422$ \\
+下退火③ & 仅评测 & argmax（不变） & 0.4494 & 0.3922 & 0.4152 & $-0.0213$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+逐折 F1 如表~\ref{tab:fold5} 所示。
+
+\begin{table}[H]
+\centering
+\caption{逐折 F1（5 折）}
+\label{tab:fold5}
+\begin{tabular}{lccccc}
+\toprule
+fold & baseline & dynamic & full & anneal \\
+\midrule
+1 & 0.4469 & 0.4143 & 0.4637 & 0.4485 \\
+2 & 0.4327 & 0.4738 & 0.3974 & 0.4736 \\
+3 & 0.4040 & 0.3934 & 0.4401 & 0.4076 \\
+4 & 0.4667 & 0.3113 & 0.2712 & 0.2876 \\
+5 & 0.4323 & 0.4413 & 0.3993 & 0.4589 \\
+\midrule
+\textbf{均值} & \textbf{0.4365} & \textbf{0.4068} & \textbf{0.3943} & \textbf{0.4152} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{四折口径：反向退火 vs 下退火 vs 基线}
+
+由于 anneal\_up 只跑 4 折，表~\ref{tab:main4} 单独给出同 4 折口径的对比。
+
+\begin{table}[H]
+\centering
+\caption{四折平均结果对比（fold 1--4）}
+\label{tab:main4}
+\begin{tabular}{lccc}
+\toprule
+方案 & P & R & F1 \\
+\midrule
+baseline（4 折） & 0.3935 & 0.5020 & \textbf{0.4376} \\
+anneal（下退火） & 0.4405 & 0.3815 & 0.4043 \\
+anneal\_up（反向退火） & 0.4459 & 0.4041 & 0.4183 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{逐折 F1（4 折口径）}
+\label{tab:fold4}
+\begin{tabular}{lccc}
+\toprule
+fold & baseline & anneal & anneal\_up \\
+\midrule
+1 & 0.4469 & 0.4485 & 0.4472 \\
+2 & 0.4327 & 0.4736 & 0.4717 \\
+3 & 0.4040 & 0.4076 & 0.4737 \\
+4 & 0.4667 & 0.2876 & 0.2808 \\
+\midrule
+\textbf{均值} & \textbf{0.4376} & \textbf{0.4043} & \textbf{0.4183} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{结果分析}
+
+\subsection{共同趋势}
+
+四组方案全部低于基线，共同趋势是``精度上升、召回下降''，且召回下降幅度大于精度上升幅度，最终 F1 被拖低。fold 4 在所有改进方案里都是最低点，是拖低均值的主要离群折。
+
+\subsection{实验①②为何低于基线}
+
+\textbf{根因：早期轮空图。} 动态阈值从 0.70 起步，而随机初始化时预测置信度约为 $1/3 < 0.70$，导致早期轮建出空图（$n_{\mathrm{edge}}=0$）。由于损失折扣 $1/(t+1)$ 使早期轮权重最高，空图恰好发生在权重最高的轮次——图增强信号在最重要的训练阶段被完全剥夺。表现上，训练学出的图增强弱，评测召回从 0.4773 跌到 0.4010。
+
+实验②在实验①的严格阈值之上又叠加持续性折扣 $\lambda\cdot C$，等效于\emph{进一步收紧}建图门槛：精度再升（0.4280$\to$0.4564）但召回再掉（0.4010$\to$0.3584），净效果更差。
+
+\subsection{实验③④为何仍低于基线}
+
+实验③④的训练已恢复为 argmax（与 baseline 一致），因此差距全部来自评测建图阈值。
+
+\textbf{冷启动自我强化}：下退火第 0 轮用最严阈值 0.65（$>$ baseline 0.6），建出最稀疏的图 $\Rightarrow$ 第一轮消息传递更弱 $\Rightarrow$ 后续置信度整体偏低 $\Rightarrow$ 即便阈值降到 0.45，被压低的置信度仍过不了线。且评测循环可能提前收敛，``后续放宽''从未真正执行。
+
+\textbf{方向验证}：反向退火（先松后紧）让 fold 3 大幅回血（0.4737 vs 下退火 0.4076），整体比下退火高 $+0.014$，说明``先松后紧''确实优于``先紧后松''。但仍不及 baseline：P 升（0.3935$\to$0.4459）、R 降（0.5020$\to$0.4041）的格局未变，fold 4 依旧崩（0.2808）。
+
+\subsection{共性结论}
+
+四个方案都指向同一事实：\textbf{在``建图''这个位置做收紧，必然以牺牲召回为代价，且召回损失沿迭代链被放大，无法靠后续放宽补回。} 阈值若要用，应放在最终输出的决策边界上，而不是图结构上。正确方向是：\textbf{建图永远用 argmax 密图保证召回，把置信度阈值挪到最终输出上剪枝}（低置信 \texttt{CAUSE}/\texttt{EFFECT} $\to$ \texttt{NONE}）。
+
+\section{遇到的问题}
+
+\begin{enumerate}
+\item \textbf{训练早期空图}：实验①②动态阈值 0.70 起步，早期轮建出空图，高权重损失轮失去图增强信号——这是实验①②失败的直接原因。
+\item \textbf{\texttt{Contrast\_pre} 的 bug}：评测期收敛判据内部误用 \texttt{self.rate}(=0.0) 而非局部 \texttt{rate}(=0.6)，使评测期收敛判据退化为 argmax 比较。影响：评测循环会多跑几轮；但它不影响建图阈值、且对所有方案一致，不改变对比结论，故未修。
+\item \textbf{评测期置信度偏低}：随机初始化（未训练）时评测建图边数为 0，需训练后置信度上升才能建出边——这是测量时需注意的现象，非 bug。
+\end{enumerate}
+
+
+\section{结论与下一步}
+
+\subsection{结论}
+
+\begin{enumerate}
+\item 基线 iLIF 成功复现：EventStoryLine v0.9 上 5 折 F1 $=$ 0.4365（P 0.4156，R 0.4773）。
+\item 四个改进方向（训练期动态阈值、训练期动态阈值+持续性、推理期下退火、推理期反向退火）\emph{均未超过基线}。
+\item ``反向退火（先松后紧）''方向被验证正确：比下退火高 $+0.014$，但幅度有限、仍不及 baseline，说明``调阈值节奏''这条路本身有天花板。
+\end{enumerate}
+
+\subsection{尚未完成的工作}
+
+\begin{enumerate}
+\item \textbf{解耦建图与过滤（最有希望、尚未实验）}：建图永远用 argmax 密图，置信度阈值只作用于最终输出——把阈值从``图''挪到``输出''的正确位置。
+\item \textbf{严格对齐 $\beta$ 参数}：按论文改用 $\beta_{\mathrm{intra}}=0.7 / \beta_{\mathrm{inter}}=0.3$ 重跑 baseline 与关键实验。
+\item \textbf{anneal\_up 补跑 fold 5}：当前只有 4 折。
+\item \textbf{数据集覆盖}：README 仅提供 EventStoryLine；若论文还涉及 MAVEN-ERE 数据集，则该部分复现尚未开始。
+\item \textbf{针对 fold 4 的处理}：fold 4 对稀疏极其敏感，可考虑针对性处理（而非全局动阈值）。
+\end{enumerate}
+
+\section*{参考文献}
+
+\begin{enumerate}
+\item Chen, L., et al.\ \emph{Identifying while Learning for Document Event Causality Identification}. ACL 2024. \url{https://aclanthology.org/2024.acl-long.210/}
+\item 代码仓库：\url{https://github.com/LchengC/iLIF}
+\end{enumerate}
+
+\section*{分工}
+
+本文实验由陈冠豪、徐天宁完成，指导老师为王邦。其中，陈冠豪负责优化改进的设计与实验验证，徐天宁负责基线的复现。
+
+\end{document}
